@@ -64,12 +64,19 @@ trash_talk = [
 
 # Create a Conversation for a group
 def create_conversation_for_group(group):
-    service_sid = os.environ['CONVERSATIONS_SERVICE_SID']
-    conversation = client.conversations.services(
-        service_sid).conversations.create(friendly_name=f"Caricket-{group}",
-                                          attributes='{"group": "' + group +
-                                          '"}')
-    return conversation.sid
+    try:
+        service_sid = os.environ.get('CONVERSATIONS_SERVICE_SID')
+        if not service_sid:
+            print("Warning: CONVERSATIONS_SERVICE_SID not set")
+            return None
+        conversation = client.conversations.services(
+            service_sid).conversations.create(friendly_name=f"Caricket-{group}",
+                                              attributes='{"group": "' + group +
+                                              '"}')
+        return conversation.sid
+    except Exception as e:
+        print(f"Error creating conversation: {e}")
+        return None
 
 
 # Add a participant to a Conversation
