@@ -282,9 +282,11 @@ def setup_data(clear_votes=False, update_existing=False):
     if clear_votes:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("TRUNCATE votes, results, scores RESTART IDENTITY")
+                cur.execute(
+                    "TRUNCATE votes, results, scores, vote_context RESTART IDENTITY"
+                )
                 conn.commit()
-                print("Votes, results, and scores cleared.")
+                print("Votes, results, scores, and vote context cleared.")
     print("Setup complete!")
 
 
@@ -300,6 +302,7 @@ def reset_database():
                 DROP TABLE IF EXISTS group_participants CASCADE;
                 DROP TABLE IF EXISTS participants CASCADE;
                 DROP TABLE IF EXISTS groups CASCADE;
+                DROP TABLE IF EXISTS vote_context CASCADE;
             """)
             conn.commit()
             print("Database reset complete!")

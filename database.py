@@ -64,6 +64,11 @@ def init_db():
             loss_streak INTEGER DEFAULT 0,
             PRIMARY KEY (participant_id, group_id)
         );
+        CREATE TABLE IF NOT EXISTS vote_context (
+            participant_id INTEGER PRIMARY KEY REFERENCES participants(id),
+            match_name VARCHAR(20) NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
     """)
     conn.commit()
     cur.close()
@@ -129,4 +134,35 @@ def activate_participant(participant_id):
             cur.execute(
                 "INSERT INTO active_participants (participant_id) VALUES (%s) ON CONFLICT (participant_id) DO NOTHING",
                 (participant_id, ))
+            conn.commit()
+
+
+def set_vote_context(participant_id, match_name):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO vote_context (participant_id, match_name)
+                VALUES (%s, %s)
+                ON CONFLICT (participant_id) DO UPDATE
+                SET match_name = EXCLUDED.match_name, created_at = NOW()
+            """, (participant_id, match_name))
+            conn.commit()
+
+
+def get_vote_context(participant_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT match_name FROM vote_context WHERE participant_id = %s",
+                (participant_id, ))
+            result = cur.fetchone()
+            return result["match_name"] if result else None
+
+
+def clear_vote_context(participant_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM vote_context WHERE participant_id = %s",
+                        (participant_id, ))
             conn.commit()

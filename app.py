@@ -1,11 +1,12 @@
 # app.py
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from database import get_db_connection, insert_participant, link_participant_to_group, fetch_existing_id, activate_participant
+from database import get_db_connection, insert_participant, link_participant_to_group, fetch_existing_id, activate_participant, get_vote_context, clear_vote_context, set_vote_context
 from voting import record_vote
 from messaging import send_vote_prompt, send_message
 from results import start_results_thread
 import os
+import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -107,6 +108,9 @@ team_acronyms = {
 
 def send_action_menu(participant, participant_id):
     now = datetime.now(ZoneInfo("UTC"))
+    print(
+        f"[APP] Sending action menu to participant_id={participant_id}, phone={participant}"
+    )
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             # Check for a live match (between start time and start time + 3h30m)
@@ -119,6 +123,7 @@ def send_action_menu(participant, participant_id):
                 ORDER BY match_time LIMIT 1
             """, (now, now))
             live_match = cur.fetchone()
+            print(f"[APP] Live match check: {live_match}")
 
             # Check for the next upcoming match to determine if the user can change their vote
             cur.execute(
@@ -129,28 +134,36 @@ def send_action_menu(participant, participant_id):
                 ORDER BY match_time LIMIT 1
             """, (now, ))
             next_match = cur.fetchone()
+            print(f"[APP] Next upcoming match: {next_match}")
 
             # Base action menu
-            message_body = "🏏 **Caricket Action Time!**\n\n"
+            message_body = "🏏 **Caricket Actions**\n\n"
 
-            # Check if a match is live
-            has_live_match = False
+            # General Actions
+            available_options = []
+
             if live_match:
-                has_live_match = True
                 team1, team2 = live_match["team1"], live_match["team2"]
                 team1_short, team2_short = team_acronyms[team1], team_acronyms[
                     team2]
-                message_body += (
-                    f"🔹 L️ **Live status of {team1_short} vs {team2_short}** 📡\n"
-                )
+                message_body += f"🔹 L️ **Live** ({team1_short} vs {team2_short}) 📡\n"
+                available_options.append("L")
 
-            # Check if the user has voted for the next upcoming match
-            has_voted = False
+            message_body += "🔹 V️ **Vote** 🏆\n"
+            message_body += "🔹 M️ **My Votes** 🗳️\n"
+            message_body += "🔹 P️ **Points** 🚀\n\n"
+            available_options.extend(["V", "M", "P"])
+
+            # Upcoming Match Actions
             if next_match:
                 match_name = next_match["match_name"]
                 team1, team2 = next_match["team1"], next_match["team2"]
                 team1_short, team2_short = team_acronyms[team1], team_acronyms[
                     team2]
+
+                message_body += f"**Upcoming [{team1_short} vs {team2_short}]**\n"
+                message_body += "🔹 W️ **Who's Where** 📊\n"
+                available_options.append("W")
 
                 cur.execute(
                     """
@@ -161,30 +174,17 @@ def send_action_menu(participant, participant_id):
                     LIMIT 1
                 """, (match_name, participant_id))
                 existing_vote = cur.fetchone()
+                print(
+                    f"[APP] Checking if participant_id={participant_id} has voted for match_name={match_name}: {existing_vote}"
+                )
 
                 if existing_vote:
-                    has_voted = True
-                    current_team = existing_vote["team"]
-                    opposite_team = team2 if current_team == team1 else team1
-                    opposite_team_short = team_acronyms[opposite_team]
-                    message_body += (
-                        f"🔹 S️ **Switch vote for next match** 🔄\n")
+                    message_body += "🔹 C️ **Change my pick** 🔄\n"
+                    available_options.append("C")
 
-            # Add the remaining options
-            message_body += ("🔹 V️ **Vote for Matches** 🏆\n"
-                             "🔹 W️ **Who’s Where?** 📊\n"
-                             "🔹 P️ **Points Table** 🚀\n"
-                             "🔹 M️ **My Votes** 🗳️\n\n")
-
-            # Dynamically adjust the instructions
-            if has_live_match and has_voted:
-                message_body += "💬 Reply *L*, *S*, *V*, *W*, *P*, or *M* to choose!"
-            elif has_live_match:
-                message_body += "💬 Reply *L*, *V*, *W*, *P*, or *M* to choose!"
-            elif has_voted:
-                message_body += "💬 Reply *S*, *V*, *W*, *P*, or *M* to choose!"
-            else:
-                message_body += "💬 Reply *V*, *W*, *P*, or *M* to choose!"
+            # Instructions
+            options_str = ", ".join(f"*{opt}*" for opt in available_options)
+            message_body += f"\n💬 Reply {options_str} to choose!"
 
             send_message(participant, message_body)
 
@@ -192,6 +192,9 @@ def send_action_menu(participant, participant_id):
 def handle_unrecognized_message(sender, message, participant_id):
     name = potential_participants_data[sender]["name"]
     now = datetime.now(ZoneInfo("UTC"))
+    print(
+        f"[APP] Handling unrecognized message from sender={sender}, message={message}, participant_id={participant_id}"
+    )
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             # Check for a live match
@@ -204,6 +207,9 @@ def handle_unrecognized_message(sender, message, participant_id):
                 ORDER BY match_time LIMIT 1
             """, (now, now))
             live_match = cur.fetchone()
+            print(
+                f"[APP] Live match check for unrecognized message: {live_match}"
+            )
 
             # Check if the user has voted for the next upcoming match
             cur.execute(
@@ -214,6 +220,9 @@ def handle_unrecognized_message(sender, message, participant_id):
                 ORDER BY match_time LIMIT 1
             """, (now, ))
             next_match = cur.fetchone()
+            print(
+                f"[APP] Next upcoming match for unrecognized message: {next_match}"
+            )
 
             has_voted = False
             if next_match:
@@ -228,32 +237,33 @@ def handle_unrecognized_message(sender, message, participant_id):
                 """, (match_name, participant_id))
                 if cur.fetchone():
                     has_voted = True
+                print(
+                    f"[APP] Has voted for next match ({match_name}): {has_voted}"
+                )
 
             if live_match and has_voted:
                 return (
-                    f"Sorry {name}, I didn’t catch that! 😅 Let’s get back to Caricket—reply *L* to see live status, *S* to switch your vote, *V* to vote, "
-                    f"*W* to see who’s where, *P* for points, or *M* to check your votes! 🏏"
+                    f"Sorry {name}, I didn’t catch that! 😅 Reply with *L*, *V*, *M*, *P*, *W*, or *C* to choose!"
                 )
             elif live_match:
                 return (
-                    f"Sorry {name}, I didn’t catch that! 😅 Let’s get back to Caricket—reply *L* to see live status, *V* to vote, "
-                    f"*W* to see who’s where, *P* for points, or *M* to check your votes! 🏏"
+                    f"Sorry {name}, I didn’t catch that! 😅 Reply with *L*, *V*, *M*, *P*, or *W* to choose!"
                 )
             elif has_voted:
                 return (
-                    f"Sorry {name}, I didn’t catch that! 😅 Let’s get back to Caricket—reply *S* to switch your vote, *V* to vote, "
-                    f"*W* to see who’s where, *P* for points, or *M* to check your votes! 🏏"
+                    f"Sorry {name}, I didn’t catch that! 😅 Reply with *V*, *M*, *P*, *W*, or *C* to choose!"
                 )
             else:
                 return (
-                    f"Sorry {name}, I didn’t catch that! 😅 Let’s get back to Caricket—reply *V* to vote, "
-                    f"*W* to see who’s where, *P* for points, or *M* to check your votes! 🏏"
+                    f"Sorry {name}, I didn’t catch that! 😅 Reply with *V*, *M*, *P*, or *W* to choose!"
                 )
 
 
 def show_current_votes(participant, participant_id):
     now = datetime.now(ZoneInfo("UTC"))
-    today = now.date()
+    print(
+        f"[APP] Showing current votes for participant_id={participant_id}, phone={participant}"
+    )
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -264,6 +274,7 @@ def show_current_votes(participant, participant_id):
                 ORDER BY match_time LIMIT 1
             """, (now, ))
             current_match = cur.fetchone()
+            print(f"[APP] Current match for votes: {current_match}")
             if not current_match:
                 name = potential_participants_data[participant]["name"]
                 send_message(
@@ -282,6 +293,9 @@ def show_current_votes(participant, participant_id):
                 "SELECT g.id, g.name FROM groups g JOIN group_participants gp ON g.id = gp.group_id WHERE gp.participant_id = %s",
                 (participant_id, ))
             sender_groups = cur.fetchall()
+            print(
+                f"[APP] Sender groups for participant_id={participant_id}: {[(g['id'], g['name']) for g in sender_groups]}"
+            )
 
             message = ""
             for group in sender_groups:
@@ -298,6 +312,9 @@ def show_current_votes(participant, participant_id):
                     WHERE g.id = %s
                 """, (group_id, ))
                 group_participants = cur.fetchall()
+                print(
+                    f"[APP] Group participants for group_id={group_id}: {[(p['id'], p['name']) for p in group_participants]}"
+                )
 
                 for p in group_participants:
                     p_id = p["id"]
@@ -324,6 +341,9 @@ def show_current_votes(participant, participant_id):
 
 def show_my_votes(participant, participant_id):
     name = potential_participants_data[participant]["name"]
+    print(
+        f"[APP] Showing my votes for participant_id={participant_id}, phone={participant}, name={name}"
+    )
     message = f"🏏 **Your Votes, {name}** (Shared across groups):\n"
     voted = False
 
@@ -338,6 +358,9 @@ def show_my_votes(participant, participant_id):
                 ORDER BY m.match_time
             """, (participant_id, ))
             votes = cur.fetchall()
+            print(
+                f"[APP] Votes for participant_id={participant_id}: {[(v['match_name'], v['team'], v['is_power_play']) for v in votes]}"
+            )
 
             for vote in votes:
                 match = vote["match_name"]
@@ -357,6 +380,7 @@ def show_my_votes(participant, participant_id):
 
 
 def get_leaderboard_with_leader(group_id):
+    print(f"[APP] Generating leaderboard for group_id={group_id}")
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -368,6 +392,9 @@ def get_leaderboard_with_leader(group_id):
                 ORDER BY s.score DESC
             """, (group_id, ))
             sorted_lb = cur.fetchall()
+            print(
+                f"[APP] Leaderboard for group_id={group_id}: {[(row['name'], row['score']) for row in sorted_lb]}"
+            )
             if not sorted_lb:
                 return "No scores yet—get voting!"
             leader_name = sorted_lb[0]["name"]
@@ -382,19 +409,40 @@ def get_leaderboard_with_leader(group_id):
 
 
 def get_live_match_status(cricapi_id):
-    # Simulate a CricAPI response for testing (since we don't have a real API key)
-    # In production, you would make an API call like:
-    # match_info_url = f"https://api.cricapi.com/v1/match_info?apikey={cricapi_key}&id={cricapi_id}"
-    # response = requests.get(match_info_url)
-    # match_data = response.json()
-    # return match_data["data"]["status"]
+    print(f"[APP] Fetching live match status for cricapi_id={cricapi_id}")
+    match_info_url = f"https://api.cricapi.com/v1/match_info?apikey={cricapi_key}&id={cricapi_id}"
+    try:
+        response = requests.get(match_info_url)
+        response.raise_for_status()
+        match_data = response.json()
+        print(f"[APP] CricAPI response: {match_data}")
 
-    # Simulated response
-    return "GT: 150/4 (18 overs), PBKS: yet to bat"
+        if "data" not in match_data or "status" not in match_data["data"]:
+            print(f"[APP] No status available for cricapi_id={cricapi_id}")
+            return "No live status available."
+
+        status = match_data["data"]["status"]
+        message = f"{status}\n"
+
+        if "score" in match_data["data"]:
+            for score in match_data["data"]["score"]:
+                inning = score["inning"]
+                runs = score["r"]
+                wickets = score["w"]
+                overs = score["o"]
+                message += f"{inning}: {runs}/{wickets} ({overs} overs)\n"
+
+        return message.strip()
+    except requests.exceptions.RequestException as e:
+        print(
+            f"[APP] Error fetching live match status for cricapi_id={cricapi_id}: {e}"
+        )
+        return "Error fetching live status."
 
 
 @app.route("/")
 def home():
+    print("[APP] Home route accessed")
     return "Welcome to the IPL Prediction Bot! This app handles WhatsApp messages at /whatsapp."
 
 
@@ -402,9 +450,11 @@ def home():
 def whatsapp():
     incoming_msg = request.values.get("Body", "").strip().lower()
     sender = request.values.get("From")
+    print(f"[APP] Received message: sender={sender}, message={incoming_msg}")
     resp = MessagingResponse()
 
     if sender not in potential_participants_data:
+        print(f"[APP] Sender {sender} not in potential participants")
         send_message(
             sender,
             "You’re not a potential participant! Contact the admin to join.")
@@ -414,6 +464,9 @@ def whatsapp():
         with conn.cursor() as cur:
             participant_id = fetch_existing_id("participants", "phone", sender)
             if not participant_id:
+                print(
+                    f"[APP] Participant not found for sender={sender}, creating new participant"
+                )
                 participant_id = insert_participant(
                     sender, potential_participants_data[sender]["name"])
                 for group_name in potential_participants_data[sender][
@@ -426,12 +479,16 @@ def whatsapp():
                     f"Welcome to the IPL Prediction Game, {potential_participants_data[sender]['name']}!"
                 )
             else:
+                print(
+                    f"[APP] Activating existing participant: sender={sender}, participant_id={participant_id}"
+                )
                 activate_participant(participant_id)
 
             cur.execute(
                 "SELECT * FROM active_participants WHERE participant_id = %s",
                 (participant_id, ))
             if not cur.fetchone():
+                print(f"[APP] Participant_id={participant_id} is not active")
                 send_message(
                     sender,
                     "You’re not an active participant yet. Send a message to join the game!"
@@ -442,31 +499,53 @@ def whatsapp():
                         (sender, ))
             participant = cur.fetchone()
             name = participant["name"]
+            print(
+                f"[APP] Participant details: phone={sender}, participant_id={participant_id}, name={name}"
+            )
 
             cur.execute(
                 "SELECT g.id, g.name FROM groups g JOIN group_participants gp ON g.id = gp.group_id WHERE gp.participant_id = %s",
                 (participant_id, ))
             sender_groups = cur.fetchall()
+            print(
+                f"[APP] Sender groups for participant_id={participant_id}: {[(g['id'], g['name']) for g in sender_groups]}"
+            )
 
             if incoming_msg == "hi":
                 send_action_menu(sender, participant_id)
             elif incoming_msg == "v":
                 now = datetime.now(ZoneInfo("UTC"))
+                print(
+                    f"[APP] Handling 'v' command: Finding next unvoted match for participant_id={participant_id}"
+                )
                 cur.execute(
                     """
                     SELECT match_name FROM matches
                     WHERE match_time > %s
-                    AND id NOT IN (SELECT match_id FROM votes v WHERE v.participant_id = %s)
+                    AND id NOT IN (
+                        SELECT match_id FROM votes v 
+                        WHERE v.participant_id = %s
+                        AND v.match_id IN (SELECT id FROM matches WHERE match_time > %s)
+                        GROUP BY match_id
+                        HAVING COUNT(*) >= (SELECT COUNT(*) FROM group_participants gp WHERE gp.participant_id = %s)
+                    )
                     ORDER BY match_time LIMIT 1
-                """, (now, participant_id))
+                """, (now, participant_id, now, participant_id))
                 match = cur.fetchone()
+                print(
+                    f"[APP] Next unvoted match for participant_id={participant_id}: {match}"
+                )
                 if match:
-                    send_vote_prompt(sender, match["match_name"], conn)
+                    send_vote_prompt(sender, match["match_name"], conn,
+                                     participant_id)
                 else:
                     send_message(sender, f"All matches voted, {name}!")
                     send_action_menu(sender, participant_id)
-            elif incoming_msg == "s":
+            elif incoming_msg == "c":
                 now = datetime.now(ZoneInfo("UTC"))
+                print(
+                    f"[APP] Handling 'c' command: Finding next match to change vote for participant_id={participant_id}"
+                )
                 cur.execute(
                     """
                     SELECT match_name, team1, team2, match_time
@@ -475,6 +554,7 @@ def whatsapp():
                     ORDER BY match_time LIMIT 1
                 """, (now, ))
                 match = cur.fetchone()
+                print(f"[APP] Next match for change: {match}")
                 if not match:
                     send_message(
                         sender,
@@ -497,6 +577,9 @@ def whatsapp():
                     LIMIT 1
                 """, (match_name, participant_id))
                 existing_vote = cur.fetchone()
+                print(
+                    f"[APP] Existing vote for match_name={match_name}, participant_id={participant_id}: {existing_vote}"
+                )
 
                 if existing_vote:
                     team = existing_vote["team"]
@@ -509,6 +592,11 @@ def whatsapp():
                         f"Reply *'PP 1'* or *'PP 2'* to use a Power Play!\n"
                         f"⏳ **Vote before:** {match_time.astimezone(ZoneInfo('Asia/Kolkata')).strftime('%I:%M %p IST on %B %d, %Y')}!"
                     )
+                    # Store the match name in vote_context for the change
+                    set_vote_context(participant_id, match_name)
+                    print(
+                        f"[APP] Set vote context for change: participant_id={participant_id}, match_name={match_name}"
+                    )
                     send_message(sender, message)
                 else:
                     send_message(
@@ -516,8 +604,148 @@ def whatsapp():
                         f"You haven’t voted for {match_name} yet, {name}! Use *V* to vote first."
                     )
                     send_action_menu(sender, participant_id)
+            elif incoming_msg in ("1", "2", "pp 1", "pp 2"):
+                now = datetime.now(ZoneInfo("UTC"))
+                print(
+                    f"[APP] Handling vote input: incoming_msg={incoming_msg}, sender={sender}, participant_id={participant_id}"
+                )
+
+                # Get the match name from vote_context
+                match_name = get_vote_context(participant_id)
+                print(
+                    f"[APP] Retrieved vote context for participant_id={participant_id}: match_name={match_name}"
+                )
+                if not match_name:
+                    print(
+                        f"[APP] No vote context found for participant_id={participant_id}, prompting to use V or C"
+                    )
+                    send_message(
+                        sender,
+                        f"Please use *V* to vote for a new match or *C* to change your vote, {name}!"
+                    )
+                    send_action_menu(sender, participant_id)
+                    return
+
+                # Fetch match details using the match name from context
+                cur.execute(
+                    """
+                    SELECT match_name, team1, team2, match_time
+                    FROM matches
+                    WHERE match_name = %s
+                """, (match_name, ))
+                match = cur.fetchone()
+                print(f"[APP] Match details from context: {match}")
+                if not match:
+                    print(f"[APP] Match not found for match_name={match_name}")
+                    send_message(
+                        sender,
+                        f"Invalid match context, {name}! Please use *V* to vote again."
+                    )
+                    clear_vote_context(participant_id)
+                    send_action_menu(sender, participant_id)
+                    return
+
+                match_time = match["match_time"]
+                if now > match_time:
+                    print(
+                        f"[APP] Match {match_name} has started at {match_time}, voting not allowed"
+                    )
+                    send_message(
+                        sender,
+                        f"Oops, {name}, {match_name} has started—too late to vote or change your vote!"
+                    )
+                    clear_vote_context(participant_id)
+                    send_action_menu(sender, participant_id)
+                    return
+
+                team = match["team1"] if "1" in incoming_msg else match["team2"]
+                is_power_play = incoming_msg.startswith("pp")
+                print(
+                    f"[APP] Recording vote for team: {team}, is_power_play: {is_power_play}, match_name: {match_name}, participant_id: {participant_id}"
+                )
+
+                # Check if this is a vote change
+                cur.execute(
+                    """
+                    SELECT team, is_power_play
+                    FROM votes
+                    WHERE match_id = (SELECT id FROM matches WHERE match_name = %s)
+                    AND participant_id = %s
+                    LIMIT 1
+                """, (match_name, participant_id))
+                existing_vote = cur.fetchone()
+                is_vote_change = existing_vote is not None
+                print(
+                    f"[APP] Is vote change: {is_vote_change}, existing vote: {existing_vote}"
+                )
+
+                if record_vote(sender, match_name, team, is_power_play):
+                    # Confirm the vote was recorded correctly by querying the votes table
+                    cur.execute(
+                        """
+                        SELECT team, is_power_play
+                        FROM votes
+                        WHERE match_id = (SELECT id FROM matches WHERE match_name = %s)
+                        AND participant_id = %s
+                    """, (match_name, participant_id))
+                    recorded_votes = cur.fetchall()
+                    print(
+                        f"[APP] Recorded votes in database for match_name={match_name}, participant_id={participant_id}: {[(v['team'], v['is_power_play']) for v in recorded_votes]}"
+                    )
+
+                    # Send appropriate message
+                    if is_vote_change:
+                        send_message(
+                            sender,
+                            f"Vote changed to {team}{' (PP)' if is_power_play else ''} for {match_name}, {name}!"
+                        )
+                    else:
+                        send_message(
+                            sender,
+                            f"Vote recorded for {team}{' (PP)' if is_power_play else ''}, {name}!"
+                        )
+
+                    # Clear the vote context
+                    clear_vote_context(participant_id)
+                    print(
+                        f"[APP] Cleared vote context for participant_id={participant_id}"
+                    )
+
+                    # Find the next unvoted match
+                    cur.execute(
+                        """
+                        SELECT match_name FROM matches
+                        WHERE match_time > %s
+                        AND id NOT IN (
+                            SELECT match_id FROM votes v 
+                            WHERE v.participant_id = %s
+                            AND v.match_id IN (SELECT id FROM matches WHERE match_time > %s)
+                            GROUP BY match_id
+                            HAVING COUNT(*) >= (SELECT COUNT(*) FROM group_participants gp WHERE gp.participant_id = %s)
+                        )
+                        ORDER BY match_time LIMIT 1
+                    """, (now, participant_id, now, participant_id))
+                    next_match = cur.fetchone()
+                    print(
+                        f"[APP] Next match after voting for participant_id={participant_id}: {next_match}"
+                    )
+                    if next_match:
+                        send_vote_prompt(sender, next_match["match_name"],
+                                         conn, participant_id)
+                    else:
+                        send_message(sender,
+                                     f"Nice one, {name}! All matches voted!")
+                        send_action_menu(sender, participant_id)
+                else:
+                    print(
+                        f"[APP] Failed to record vote for match_name={match_name}, team={team}, is_power_play={is_power_play}"
+                    )
+                    send_message(sender, "Invalid vote or match started!")
+                    clear_vote_context(participant_id)
+                    send_action_menu(sender, participant_id)
             elif incoming_msg == "l":
                 now = datetime.now(ZoneInfo("UTC"))
+                print(f"[APP] Handling 'l' command: Finding live match")
                 cur.execute(
                     """
                     SELECT match_name, team1, team2, cricapi_id
@@ -527,6 +755,7 @@ def whatsapp():
                     ORDER BY match_time LIMIT 1
                 """, (now, now))
                 live_match = cur.fetchone()
+                print(f"[APP] Live match: {live_match}")
                 if not live_match:
                     send_message(sender,
                                  f"No match is currently live, {name}!")
@@ -539,80 +768,19 @@ def whatsapp():
                     team2]
                 cricapi_id = live_match["cricapi_id"]
 
-                # Fetch live status (simulated for testing)
+                # Fetch live status
                 status = get_live_match_status(cricapi_id)
                 message = (
-                    f"🏏 **Live Status of {match_name}: {team1_short} 🆚 {team2_short}**\n\n"
+                    f"🏏 **Live Status of {team1_short} vs {team2_short}**\n\n"
                     f"{status}")
                 send_message(sender, message)
                 send_action_menu(sender, participant_id)
-            elif incoming_msg in ("1", "2", "pp 1", "pp 2"):
-                now = datetime.now(ZoneInfo("UTC"))
-                cur.execute(
-                    """
-                    SELECT match_name, team1, team2, match_time
-                    FROM matches
-                    WHERE match_time > %s
-                    ORDER BY match_time LIMIT 1
-                """, (now, ))
-                match = cur.fetchone()
-                if not match:
-                    send_message(sender,
-                                 f"No upcoming matches to vote for, {name}!")
-                    send_action_menu(sender, participant_id)
-                    return
-
-                match_name = match["match_name"]
-                match_time = match["match_time"]
-                if now > match_time:
-                    send_message(
-                        sender,
-                        f"Oops, {name}, {match_name} has started—too late to vote or change your vote!"
-                    )
-                    send_action_menu(sender, participant_id)
-                    return
-
-                team = match["team1"] if "1" in incoming_msg else match["team2"]
-                is_power_play = incoming_msg.startswith("pp")
-                if record_vote(sender, match_name, team, is_power_play):
-                    cur.execute(
-                        """
-                        SELECT team, is_power_play
-                        FROM votes
-                        WHERE match_id = (SELECT id FROM matches WHERE match_name = %s)
-                        AND participant_id = %s
-                        AND (team != %s OR is_power_play != %s)
-                        LIMIT 1
-                    """, (match_name, participant_id, team, is_power_play))
-                    if cur.rowcount > 0:
-                        send_message(
-                            sender,
-                            f"Vote changed to {team}{' (PP)' if is_power_play else ''} for {match_name}, {name}!"
-                        )
-                    else:
-                        send_message(sender,
-                                     f"Vote recorded for {team}, {name}!")
-                    cur.execute(
-                        """
-                        SELECT match_name FROM matches
-                        WHERE match_time > NOW()
-                        AND id NOT IN (SELECT match_id FROM votes v WHERE v.participant_id = %s)
-                        ORDER BY match_time LIMIT 1
-                    """, (participant_id, ))
-                    next_match = cur.fetchone()
-                    if next_match:
-                        send_vote_prompt(sender, next_match["match_name"],
-                                         conn)
-                    else:
-                        send_message(sender,
-                                     f"Nice one, {name}! All matches voted!")
-                        send_action_menu(sender, participant_id)
-                else:
-                    send_message(sender, "Invalid vote or match started!")
-                    send_action_menu(sender, participant_id)
             elif incoming_msg == "w":
                 show_current_votes(sender, participant_id)
             elif incoming_msg == "p":
+                print(
+                    f"[APP] Handling 'p' command: Generating points table for participant_id={participant_id}"
+                )
                 message = ""
                 for group in sender_groups:
                     group_id = group["id"]
@@ -632,5 +800,6 @@ def whatsapp():
 
 
 if __name__ == "__main__":
+    print("[APP] Starting Flask app...")
     start_results_thread(cricapi_key)
     app.run(host="0.0.0.0", port=8080)
