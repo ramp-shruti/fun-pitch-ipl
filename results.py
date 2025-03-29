@@ -56,24 +56,21 @@ def update_scores(match_id, match_name, winner):
                         )
                     continue
 
-                # If there are no winners, losers lose points but no redistribution
+                # If there are no winners, losers get 0 points (zero-sum)
                 if not winners:
                     for participant in group_votes:
                         participant_id = participant["participant_id"]
-                        is_power_play = participant["is_power_play"]
-                        base_points = 20 if is_power_play else 10
-                        points = -base_points  # Losers lose points
+                        # Update scores (no points deducted)
                         cur.execute(
                             """
                             INSERT INTO scores (participant_id, group_id, score, power_play_count, win_streak, loss_streak)
-                            VALUES (%s, %s, %s, 0, 0, 0)
+                            VALUES (%s, %s, 0, 0, 0, 0)
                             ON CONFLICT (participant_id, group_id)
-                            DO UPDATE SET score = scores.score + %s,
-                                          win_streak = 0,
+                            DO UPDATE SET win_streak = 0,
                                           loss_streak = GREATEST(scores.loss_streak + 1, 0)
-                        """, (participant_id, group_id, points, points))
+                        """, (participant_id, group_id))
                         print(
-                            f"[RESULTS] No winners in group_id={group_id}, participant_id={participant_id} loses {points} points"
+                            f"[RESULTS] No winners in group_id={group_id}, participant_id={participant_id} gets 0 points"
                         )
                     continue
 
@@ -132,75 +129,70 @@ def update_scores(match_id, match_name, winner):
 
 def check_and_update_results(cricapi_key):
     while True:
-        now = datetime.now(ZoneInfo("UTC"))
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                # Find matches that have ended but don't have results yet
-                cur.execute(
-                    """
-                    SELECT id, match_name, cricapi_id
-                    FROM matches
-                    WHERE match_time + INTERVAL '3 hours 30 minutes' < %s
-                    AND id NOT IN (SELECT match_id FROM results)
-                """, (now, ))
-                ended_matches = cur.fetchall()
-                print(
-                    f"[RESULTS] Ended matches without results: {[(m['id'], m['match_name']) for m in ended_matches]}"
-                )
+        try:
+            now = datetime.now(ZoneInfo("UTC"))
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    # Find matches that have ended but don't have results yet
+                    cur.execute(
+                        """
+                        SELECT id, match_name, cricapi_id
+                        FROM matches
+                        WHERE match_time + INTERVAL '3 hours 30 minutes' < %s
+                        AND id NOT IN (SELECT match_id FROM results)
+                    """, (now, ))
+                    ended_matches = cur.fetchall()
+                    print(
+                        f"[RESULTS] Ended matches without results: {[(m['id'], m['match_name']) for m in ended_matches]}"
+                    )
 
-                for match in ended_matches:
-                    match_id = match["id"]
-                    match_name = match["match_name"]
-                    cricapi_id = match["cricapi_id"]
+                    for match in ended_matches:
+                        match_id = match["id"]
+                        match_name = match["match_name"]
+                        cricapi_id = match["cricapi_id"]
 
-                    # Fetch match result from CricAPI
-                    match_info_url = f"https://api.cricapi.com/v1/match_info?apikey={cricapi_key}&id={cricapi_id}"
-                    try:
-                        response = requests.get(match_info_url)
-                        response.raise_for_status()
-                        match_data = response.json()
-                        print(
-                            f"[RESULTS] CricAPI response for match_id={match_id}: {match_data}"
-                        )
+                        # Fetch match result from CricAPI
+                        match_info_url = f"https://api.cricapi.com/v1/match_info?apikey={cricapi_key}&id={cricapi_id}"
+                        try:
+                            response = requests.get(match_info_url)
+                            response.raise_for_status()
+                            match_data = response.json()
+                            print(
+                                f"[RESULTS] CricAPI response for match_id={match_id}: {match_data}"
+                            )
 
-                        if "data" in match_data and match_data["data"][
-                                "matchEnded"]:
-                            winner = None
-                            if "score" in match_data["data"]:
-                                scores = match_data["data"]["score"]
-                                if len(scores) >= 2:  # Assuming two innings
-                                    team1_score = scores[0]["r"]
-                                    team2_score = scores[1]["r"]
-                                    team1 = match_data["data"]["teams"][0]
-                                    team2 = match_data["data"]["teams"][1]
-                                    if team1_score > team2_score:
-                                        winner = team1
-                                    elif team2_score > team1_score:
-                                        winner = team2
-                                    print(
-                                        f"[RESULTS] Determined winner for match_id={match_id}: {winner}"
-                                    )
-
-                            if winner:
-                                # Insert result into the database
-                                cur.execute(
-                                    """
-                                    INSERT INTO results (match_id, winner)
-                                    VALUES (%s, %s)
-                                """, (match_id, winner))
-                                conn.commit()
+                            if "data" in match_data and match_data["data"][
+                                    "matchEnded"]:
+                                winner = match_data["data"].get("matchWinner")
                                 print(
-                                    f"[RESULTS] Result recorded for match_id={match_id}: Winner={winner}"
+                                    f"[RESULTS] Determined winner for match_id={match_id}: {winner}"
                                 )
 
-                                # Update scores
-                                update_scores(match_id, match_name, winner)
-                    except requests.exceptions.RequestException as e:
-                        print(
-                            f"[RESULTS] Error fetching result for match_id={match_id}: {e}"
-                        )
+                                if winner:
+                                    # Insert result into the database
+                                    cur.execute(
+                                        """
+                                        INSERT INTO results (match_id, winner)
+                                        VALUES (%s, %s)
+                                    """, (match_id, winner))
+                                    conn.commit()
+                                    print(
+                                        f"[RESULTS] Result recorded for match_id={match_id}: Winner={winner}"
+                                    )
 
-        time.sleep(300)  # Check every 5 minutes
+                                    # Update scores
+                                    update_scores(match_id, match_name, winner)
+                                else:
+                                    print(
+                                        f"[RESULTS] No winner determined for match_id={match_id}"
+                                    )
+                        except requests.exceptions.RequestException as e:
+                            print(
+                                f"[RESULTS] Error fetching result for match_id={match_id}: {e}"
+                            )
+        except Exception as e:
+            print(f"[RESULTS] Error in check_and_update_results: {e}")
+        time.sleep(60)  # Check every 1 minute
 
 
 def start_results_thread(cricapi_key):

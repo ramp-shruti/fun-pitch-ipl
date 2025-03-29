@@ -4,7 +4,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 from database import get_db_connection, insert_participant, link_participant_to_group, fetch_existing_id, activate_participant, get_vote_context, clear_vote_context, set_vote_context
 from voting import record_vote
 from messaging import send_vote_prompt, send_message
-from results import start_results_thread
+from results import start_results_thread, update_scores
 import os
 import requests
 from datetime import datetime, timedelta
@@ -12,6 +12,10 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 cricapi_key = os.environ.get('CRICAPI_KEY')
+
+# Start the results thread when the app is initialized
+print("[APP] Starting Flask app...")
+start_results_thread(cricapi_key)
 
 potential_participants_data = {
     "whatsapp:+919810272993": {
@@ -437,7 +441,7 @@ def get_live_match_status(cricapi_id):
         print(
             f"[APP] Error fetching live match status for cricapi_id={cricapi_id}: {e}"
         )
-        return "Error fetching live status."
+        return "Error fetching live status. Admin can update results manually by sending '97242'."
 
 
 @app.route("/")
@@ -511,6 +515,174 @@ def whatsapp():
                 f"[APP] Sender groups for participant_id={participant_id}: {[(g['id'], g['name']) for g in sender_groups]}"
             )
 
+            # Special participant ID for admin result updates
+            ADMIN_RESULT_PARTICIPANT_ID = 97242
+
+            # Handle admin message "97242" to update match results
+            if incoming_msg == "97242" and sender == "whatsapp:+919810272993":  # Ram only
+                now = datetime.now(ZoneInfo("UTC"))
+                print(
+                    f"[APP] Admin (Ram) requested to update match results: sender={sender}, participant_id={participant_id}"
+                )
+                cur.execute(
+                    """
+                    SELECT id, match_name, team1, team2
+                    FROM matches
+                    WHERE match_time + INTERVAL '3 hours 30 minutes' < %s
+                    AND id NOT IN (SELECT match_id FROM results)
+                    ORDER BY match_time
+                """, (now, ))
+                ended_matches = cur.fetchall()
+                print(
+                    f"[APP] Ended matches without results: {[(m['id'], m['match_name']) for m in ended_matches]}"
+                )
+
+                if not ended_matches:
+                    send_message(sender,
+                                 "No ended matches need result updates, Ram!")
+                    send_action_menu(sender, participant_id)
+                    return str(resp)
+
+                # Take the first ended match and prompt Ram to pick the winner
+                match = ended_matches[0]
+                match_id = match["id"]
+                match_name = match["match_name"]
+                team1, team2 = match["team1"], match["team2"]
+                team1_short, team2_short = team_acronyms[team1], team_acronyms[
+                    team2]
+
+                message = (
+                    f"🏏 **Update Result for {match_name}: {team1_short} 🆚 {team2_short}**\n\n"
+                    f"Pick the winning team, Ram:\n"
+                    f"Reply *'R1'* for **{team1_short}**\n"
+                    f"Reply *'R2'* for **{team2_short}**")
+                # Store the match in vote_context using the special participant ID
+                set_vote_context(ADMIN_RESULT_PARTICIPANT_ID, match_name)
+                print(
+                    f"[APP] Set vote context for result update: participant_id={ADMIN_RESULT_PARTICIPANT_ID}, match_name={match_name}"
+                )
+                send_message(sender, message)
+                return str(resp)
+
+            # Handle admin result update responses ("R1" or "R2")
+            if incoming_msg in (
+                    "r1",
+                    "r2") and sender == "whatsapp:+919810272993":  # Ram only
+                now = datetime.now(ZoneInfo("UTC"))
+                print(
+                    f"[APP] Admin (Ram) updating match result: sender={sender}, participant_id={participant_id}, message={incoming_msg}"
+                )
+
+                # Get the match name from vote_context using the special participant ID
+                match_name = get_vote_context(ADMIN_RESULT_PARTICIPANT_ID)
+                print(
+                    f"[APP] Retrieved vote context for result update: participant_id={ADMIN_RESULT_PARTICIPANT_ID}, match_name={match_name}"
+                )
+                if not match_name:
+                    print(
+                        f"[APP] No result update context found for participant_id={ADMIN_RESULT_PARTICIPANT_ID}"
+                    )
+                    send_message(
+                        sender,
+                        "Please start the result update process by sending '97242', Ram!"
+                    )
+                    send_action_menu(sender, participant_id)
+                    return str(resp)
+
+                # Fetch match details using the match name from context
+                cur.execute(
+                    """
+                    SELECT id, match_name, team1, team2, match_time
+                    FROM matches
+                    WHERE match_name = %s
+                """, (match_name, ))
+                match = cur.fetchone()
+                print(f"[APP] Match details from context: {match}")
+                if not match:
+                    print(f"[APP] Match not found for match_name={match_name}")
+                    send_message(
+                        sender,
+                        f"Invalid match context, Ram! Please start the result update process again by sending '97242'."
+                    )
+                    clear_vote_context(ADMIN_RESULT_PARTICIPANT_ID)
+                    send_action_menu(sender, participant_id)
+                    return str(resp)
+
+                match_id = match["id"]
+                match_time = match["match_time"]
+                if now < match_time + timedelta(hours=3, minutes=30):
+                    print(
+                        f"[APP] Match {match_name} is still ongoing at {match_time}, result update not allowed"
+                    )
+                    send_message(
+                        sender,
+                        f"Oops, Ram, {match_name} is still ongoing—too early to update the result!"
+                    )
+                    clear_vote_context(ADMIN_RESULT_PARTICIPANT_ID)
+                    send_action_menu(sender, participant_id)
+                    return str(resp)
+
+                team = match["team1"] if incoming_msg == "r1" else match[
+                    "team2"]
+                print(
+                    f"[APP] Admin selected winner for match_id={match_id}: {team}"
+                )
+
+                # Insert the result into the results table
+                cur.execute(
+                    """
+                    INSERT INTO results (match_id, winner)
+                    VALUES (%s, %s)
+                """, (match_id, team))
+                conn.commit()
+                print(
+                    f"[APP] Result recorded for match_id={match_id}: Winner={team}"
+                )
+
+                # Update scores
+                update_scores(match_id, match_name, team)
+                send_message(
+                    sender,
+                    f"Result updated for {match_name}: {team} wins! Scores have been updated."
+                )
+                clear_vote_context(ADMIN_RESULT_PARTICIPANT_ID)
+
+                # Check if there are more ended matches to update
+                cur.execute(
+                    """
+                    SELECT id, match_name, team1, team2
+                    FROM matches
+                    WHERE match_time + INTERVAL '3 hours 30 minutes' < %s
+                    AND id NOT IN (SELECT match_id FROM results)
+                    ORDER BY match_time
+                """, (now, ))
+                ended_matches = cur.fetchall()
+                print(
+                    f"[APP] Remaining ended matches without results: {[(m['id'], m['match_name']) for m in ended_matches]}"
+                )
+
+                if ended_matches:
+                    match = ended_matches[0]
+                    match_id = match["id"]
+                    match_name = match["match_name"]
+                    team1, team2 = match["team1"], match["team2"]
+                    team1_short, team2_short = team_acronyms[
+                        team1], team_acronyms[team2]
+
+                    message = (
+                        f"🏏 **Update Result for {match_name}: {team1_short} 🆚 {team2_short}**\n\n"
+                        f"Pick the winning team, Ram:\n"
+                        f"Reply *'R1'* for **{team1_short}**\n"
+                        f"Reply *'R2'* for **{team2_short}**")
+                    set_vote_context(ADMIN_RESULT_PARTICIPANT_ID, match_name)
+                    print(
+                        f"[APP] Set vote context for result update: participant_id={ADMIN_RESULT_PARTICIPANT_ID}, match_name={match_name}"
+                    )
+                    send_message(sender, message)
+                else:
+                    send_action_menu(sender, participant_id)
+                return str(resp)
+
             if incoming_msg == "hi":
                 send_action_menu(sender, participant_id)
             elif incoming_msg == "v":
@@ -560,7 +732,7 @@ def whatsapp():
                         sender,
                         f"No upcoming matches to change votes for, {name}!")
                     send_action_menu(sender, participant_id)
-                    return
+                    return str(resp)
 
                 match_name = match["match_name"]
                 match_time = match["match_time"]
@@ -624,7 +796,7 @@ def whatsapp():
                         f"Please use *V* to vote for a new match or *C* to change your vote, {name}!"
                     )
                     send_action_menu(sender, participant_id)
-                    return
+                    return str(resp)
 
                 # Fetch match details using the match name from context
                 cur.execute(
@@ -643,7 +815,7 @@ def whatsapp():
                     )
                     clear_vote_context(participant_id)
                     send_action_menu(sender, participant_id)
-                    return
+                    return str(resp)
 
                 match_time = match["match_time"]
                 if now > match_time:
@@ -656,7 +828,7 @@ def whatsapp():
                     )
                     clear_vote_context(participant_id)
                     send_action_menu(sender, participant_id)
-                    return
+                    return str(resp)
 
                 team = match["team1"] if "1" in incoming_msg else match["team2"]
                 is_power_play = incoming_msg.startswith("pp")
@@ -760,7 +932,7 @@ def whatsapp():
                     send_message(sender,
                                  f"No match is currently live, {name}!")
                     send_action_menu(sender, participant_id)
-                    return
+                    return str(resp)
 
                 match_name = live_match["match_name"]
                 team1, team2 = live_match["team1"], live_match["team2"]
@@ -800,6 +972,4 @@ def whatsapp():
 
 
 if __name__ == "__main__":
-    print("[APP] Starting Flask app...")
-    start_results_thread(cricapi_key)
     app.run(host="0.0.0.0", port=8080)
